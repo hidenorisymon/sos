@@ -7,7 +7,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
   if (!window.supabase) { console.error('[SA] Supabase CDN not loaded.'); return; }
 
   const client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    auth: { flowType: 'implicit', detectSessionInUrl: false, persistSession: true },
+    auth: { flowType: 'implicit', detectSessionInUrl: true, persistSession: true },
   });
 
   const _state = { session: null, status: null, ready: false };
@@ -65,20 +65,12 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
   });
 
   (async function init() {
-    const hash = window.location.hash;
-    if (hash && hash.includes('access_token=')) {
-      const p = new URLSearchParams(hash.substring(1));
-      const at = p.get('access_token');
-      const rt = p.get('refresh_token');
-      if (at && rt) {
-        const { data, error } = await client.auth.setSession({ access_token: at, refresh_token: rt });
-        if (!error && data.session) {
-          _state.session = data.session;
-          _state.status = await getStatus(data.session);
-        }
-      }
+    // Clean the URL hash after Supabase has read the tokens (detectSessionInUrl:true handles extraction)
+    if (window.location.hash && window.location.hash.includes('access_token=')) {
       window.history.replaceState({}, document.title, _cleanUrl);
     }
+    // Give Supabase a tick to finish processing the hash before we call getSession
+    await new Promise(r => setTimeout(r, 50));
     if (!_state.session) {
       const session = await getSession();
       _state.session = session;
