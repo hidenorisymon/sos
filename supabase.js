@@ -60,6 +60,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
   client.auth.onAuthStateChange(async (event, session) => {
     _state.session = session;
+    _maybeFinishGcalConnect(session);
     _state.status = await getStatus(session);
     _notify(event, session, _state.status);
   });
@@ -365,5 +366,45 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
   }
   client.auth.onAuthStateChange((_e, session) => { if (session) { _migrateOnce().then(_cleanupResearchOnce); } });
 
-  window.SupabaseAuth = { signInWithGoogle, signOut, getSession, getStatus, onAuthStateChange, _state };
+  // ===== Google Calendar + Tasks (two-way sync) =====
+  async function connectGoogleCalendar() {
+    try { localStorage.setItem('bd-gcal-connecting', '1'); } catch (e) {}
+    const { error } = await client.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        scopes: 'openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks',
+        redirectTo: _cleanUrl,
+        queryParams: { access_type: 'offline', prompt: 'consent' },
+      },
+    });
+    if (error) { console.error('[SA] connectGoogleCalendar:', error.message); try { localStorage.removeItem('bd-gcal-connecting'); } catch (e) {} }
+  }
+  async function _maybeFinishGcalConnect(session) {
+    let flag = null; try { flag = localStorage.getItem('bd-gcal-connecting'); } catch (e) {}
+    if (flag !== '1') return;
+    const rt = session && session.provider_refresh_token;
+    if (!rt) return; // only present on the live OAuth redirect event
+    try {
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/google-calendar', {
+        method: 'POST',
+        headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + session.access_token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'connect', refresh_token: rt }),
+      });
+      if (!resp.ok) { console.error('[SA] gcal connect failed:', resp.status); return; }
+      try { localStorage.removeItem('bd-gcal-connecting'); localStorage.setItem('bd-gcal-connected', '1'); } catch (e) {}
+      console.log('[SA] Google Calendar + Tasks connected');
+    } catch (e) { console.error('[SA] gcal connect error:', e && e.message); }
+  }
+  async function gcal(action, payload) {
+    if (!_state.session) throw new Error('not signed in');
+    const resp = await fetch(SUPABASE_URL + '/functions/v1/google-calendar', {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + _state.session.access_token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ action: action }, payload || {})),
+    });
+    let j = null; try { j = await resp.json(); } catch (e) {}
+    if (!resp.ok) { const err = new Error((j && j.error) || resp.statusText); err.status = resp.status; throw err; }
+    return j;
+  }
+  window.SupabaseAuth = { signInWithGoogle, connectGoogleCalendar, gcal, signOut, getSession, getStatus, onAuthStateChange, _state };
 })();
