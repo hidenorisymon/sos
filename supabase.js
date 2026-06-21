@@ -205,6 +205,8 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
         if (r.error) throw r.error;
         const map = {};
         (r.data || []).forEach(row => { map[row.key] = row.value; });
+        // record the last-synced cloud snapshot for the shared data keys (merge base)
+        [_DK.tasks, _DK.cats, _DK.exp].forEach(k => { if (map[k] != null) _baseSet(k, map[k]); });
         return (_kv = map);
       } catch (e) { console.warn('[SA] kv load:', e && e.message); _kvPromise = null; return null; }
     })();
@@ -220,6 +222,60 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
     if (_kv) _kv[key] = blob;
   }
 
+  // ===== 3-way merge: Kiko + the app (and other devices) can't overwrite each other =====
+  // Shared data keys that multiple writers touch. For these, every save MERGES with the
+  // freshest cloud copy using a "base" snapshot (last value we synced) so that: adds from
+  // either side are kept, real deletes propagate, and an empty/failed load can't wipe data.
+  const _DK = { tasks: 'bd-e5', cats: 'bd-c5', exp: 'bd-exp5' };
+  const _isData = (k) => k === _DK.tasks || k === _DK.cats || k === _DK.exp;
+  const _baseGet = (k) => { try { const v = localStorage.getItem('bd-base-' + k); return v ? JSON.parse(v) : null; } catch (e) { return null; } };
+  const _baseSet = (k, v) => { try { localStorage.setItem('bd-base-' + k, JSON.stringify(v)); } catch (e) {} };
+  function _mergeArr(base, ours, theirs) {
+    base = Array.isArray(base) ? base : []; ours = Array.isArray(ours) ? ours : []; theirs = Array.isArray(theirs) ? theirs : [];
+    if (ours.length === 0 && theirs.length > 0) return theirs.slice(); // anti-wipe: never let empty erase a full cloud
+    const ourIds = new Set(ours.map(x => x && x.id)), baseIds = new Set(base.map(x => x && x.id));
+    const out = ours.slice();
+    for (const t of theirs) if (t && t.id != null && !ourIds.has(t.id) && !baseIds.has(t.id)) out.push(t); // external add → keep
+    return out;
+  }
+  function _mergeObj(base, ours, theirs) { // budgets {category: amount}
+    base = base || {}; ours = ours || {}; theirs = theirs || {};
+    const out = Object.assign({}, theirs, ours);
+    for (const k of Object.keys(base)) if (!(k in ours)) delete out[k]; // honor deletes
+    return out;
+  }
+  const _flatTasks = (o) => { const out = []; if (o && typeof o === 'object') for (const c of Object.keys(o)) (Array.isArray(o[c]) ? o[c] : []).forEach(t => { if (t && t.id != null) out.push(Object.assign({}, t, { category: t.category || c })); }); return out; };
+  function _mergeExp(base, ours, theirs) {
+    base = base || {}; ours = ours || {}; theirs = theirs || {};
+    return {
+      expenses: _mergeArr(base.expenses, ours.expenses, theirs.expenses),
+      income: _mergeArr(base.income, ours.income, theirs.income),
+      streams: _mergeArr(base.streams, ours.streams, theirs.streams),
+      budgets: _mergeObj(base.budgets, ours.budgets, theirs.budgets),
+    };
+  }
+  function _mergeEntries(base, ours, theirs) {
+    const merged = _mergeArr(_flatTasks(base), _flatTasks(ours), _flatTasks(theirs));
+    const g = {}; merged.forEach(t => { const c = t.category || 'todo'; (g[c] = g[c] || []).push(t); });
+    if (ours && typeof ours === 'object') for (const c of Object.keys(ours)) if (!(c in g)) g[c] = []; // keep empty columns
+    return g;
+  }
+  function _mergeBlob(key, ours, theirs) {
+    const base = _baseGet(key);
+    if (key === _DK.exp) return _mergeExp(base, ours, theirs);
+    if (key === _DK.tasks) return _mergeEntries(base, ours, theirs);
+    if (key === _DK.cats) return _mergeArr(base, ours, theirs);
+    return ours;
+  }
+  async function _freshCloud(key) { // value | null (no row / no ws) | undefined (read FAILED)
+    const ws = await _getWorkspace(); if (!ws) return null;
+    try {
+      const r = await client.from('app_state').select('value').eq('workspace_id', ws).eq('key', key).limit(1);
+      if (r.error) throw r.error;
+      return (r.data && r.data.length) ? r.data[0].value : null;
+    } catch (e) { console.warn('[SA] fresh read', key, e && e.message); return undefined; }
+  }
+
   window.storage = {
     get: async function (key) {
       try { const kv = await _loadKV(); if (kv && kv[key] != null) return { value: JSON.stringify(kv[key]) }; }
@@ -228,9 +284,13 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
     },
     set: async function (key, jsonStr) {
       let blob; try { blob = JSON.parse(jsonStr); } catch (e) { return; }
-      // cloud blob (cross-device sync) — keep this first so reads stay correct
+      if (_isData(key)) {
+        const theirs = await _freshCloud(key);
+        if (theirs === undefined) { console.warn('[SA] cloud read failed; skipping cloud write for', key); return; } // never clobber on a failed read
+        blob = _mergeBlob(key, blob, theirs); // 3-way merge: keep both sides' adds, honor deletes
+        _baseSet(key, blob);
+      }
       try { await _kvSet(key, blob); } catch (e) { console.warn('[SA] kv set failed for', key, e && e.message); }
-      // relational projection (for the future Action Button + AI assistant)
       try { await _mirror(key, blob); } catch (e) { console.warn('[SA] mirror failed for', key, e && e.message); }
     }
   };
