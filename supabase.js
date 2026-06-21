@@ -132,6 +132,31 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
     subcategory: s.subcategory || null, amount: Number(s.amount) || 0, created_at: _iso(s.createdAt) })); }
   function _budgetRows(ws, b) { const o = (b && b.budgets) || {}; return Object.keys(o).map(cat => ({
     workspace_id: ws, category: cat, amount: Number(o[cat]) || 0 })); }
+  // coerce a chat message's content (string | array | {text|content}) to text — mirrors the app's bdStr
+  function _str(v) {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (Array.isArray(v)) return v.map(_str).join(' ');
+    if (typeof v === 'object') return typeof v.text === 'string' ? v.text : _str(v.content);
+    return '';
+  }
+  function _chatRows(ws, b) { // blob = flat message array (no ids) -> synthesize stable index ids
+    return (Array.isArray(b) ? b : []).map((m, i) => ({ m, i })).filter(x => x.m && _str(x.m.content).trim() !== '')
+      .map(({ m, i }) => ({ id: 'c' + i, workspace_id: ws, role: m.role || '', content: _str(m.content),
+        thread_id: 'main', created_at: _iso(m.ts) }));
+  }
+  function _docRows(ws, b) { // blob = { [docId]: {title, notes, messages[], createdAt} }
+    const out = [];
+    if (b && typeof b === 'object') for (const id of Object.keys(b)) { const d = b[id]; if (!d) continue;
+      out.push({ id: String(id), workspace_id: ws, title: d.title || '', body: '', notes: d.notes || '',
+        messages: Array.isArray(d.messages) ? d.messages : [], created_at: _iso(d.createdAt) }); }
+    return out;
+  }
+  function _notifRows(ws, b) { // blob = [ {id, title, body, read, createdAt} ]
+    return (Array.isArray(b) ? b : []).filter(n => n && n.id).map(n => ({ id: String(n.id), workspace_id: ws,
+      title: n.title || '', body: n.body || '', is_read: !!n.read, created_at: _iso(n.createdAt) }));
+  }
   async function _syncTable(table, ws, rows, keyField) {
     keyField = keyField || 'id';
     const keys = rows.map(r => String(r[keyField]));
@@ -160,7 +185,10 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
     else if (key === _V.dark) await _syncSettings({ dark_mode: !!blob });
     else if (key === _V.dinstr) await _syncSettings({ daily_instructions: blob || '' });
     else if (key === _V.winstr) await _syncSettings({ weekly_instructions: blob || '' });
-    // chat / docs / notifs / review / recur / tokens: still safe in localStorage; mirrored in a later step
+    else if (key === _V.chat) await _syncTable('chat_messages', ws, _chatRows(ws, blob));
+    else if (key === _V.docs) await _syncTable('docs', ws, _docRows(ws, blob));
+    else if (key === _V.notifs) await _syncTable('notifications', ws, _notifRows(ws, blob));
+    // review / recur / tokens: settings-ish, still cloud-synced via app_state; no relational projection needed
   }
   // ----- Phase 2b: app_state key→blob store (the read path / cross-device sync) -----
   // Stores the EXACT blob the app writes, so reads round-trip identically (no
@@ -211,14 +239,14 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
   async function _migrateOnce() {
     const ws = await _getWorkspace();
     if (!ws) return;
-    // one-time relational mirror seed
-    if (!_migrated && !localStorage.getItem('bd-mirror-v1')) {
+    // one-time relational mirror seed (v2 adds chat/docs/notifs projection)
+    if (!_migrated && !localStorage.getItem('bd-mirror-v2')) {
       _migrated = true;
-      for (const k of [_V.entries, _V.cats, _V.tags, _V.expenses, _V.dark, _V.dinstr, _V.winstr]) {
+      for (const k of [_V.entries, _V.cats, _V.tags, _V.expenses, _V.dark, _V.dinstr, _V.winstr, _V.chat, _V.docs, _V.notifs]) {
         try { const v = localStorage.getItem(k); if (v != null) await _mirror(k, JSON.parse(v)); }
         catch (e) { console.warn('[SA] migrate', k, e && e.message); }
       }
-      localStorage.setItem('bd-mirror-v1', '1');
+      localStorage.setItem('bd-mirror-v2', '1');
       console.log('[SA] initial cloud mirror complete');
     }
     // one-time app_state (blob) seed — pushes every local key up so other devices can read it
